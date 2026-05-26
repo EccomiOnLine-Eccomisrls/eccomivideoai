@@ -70,9 +70,10 @@ def genera_file_srt(testo: str, durata_totale: float, srt_path: str):
             f.write(f"{testo_blocco}\n\n")
 
 def get_audio_duration(audio_path: str) -> float:
+    # Parametro "-of csv=p=0" modificato per massima compatibilità universale Linux
     cmd = [
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nocrekey=1", audio_path
+        "-of", "csv=p=0", audio_path
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     
@@ -118,13 +119,11 @@ async def genera_video_finale(audio_url: str, immagini: list[str], testo_script:
         local_srt = os.path.join(tmpdir, "subtitles.srt")
         local_output = os.path.join(tmpdir, "output_video.mp4")
         
-        # 1. Download sicuro dell'Audio da Runpod/Supabase
+        # 1. Download dell'Audio
         print(f"⬇️ Scarico l'audio dall'URL: {audio_url}")
         r_audio = requests.get(audio_url)
         
         if r_audio.status_code != 200:
-            print(f"❌ Errore download audio. Status: {r_audio.status_code}")
-            print(f"❌ Contenuto risposta errore: {r_audio.text[:500]}")
             raise Exception(f"Impossibile scaricare l'audio generato. Status code: {r_audio.status_code}")
             
         with open(local_audio, "wb") as f:
@@ -141,7 +140,7 @@ async def genera_video_finale(audio_url: str, immagini: list[str], testo_script:
         with open(local_image, "wb") as f:
             f.write(r_img.content)
             
-        # 3. Calcolo durata audio (ora protetto da log estesi)
+        # 3. Calcolo durata audio
         durata = get_audio_duration(local_audio)
         print(f"⏱️ Durata audio calcolata: {durata} secondi")
         
