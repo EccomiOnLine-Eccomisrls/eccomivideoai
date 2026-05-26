@@ -130,7 +130,7 @@ async def genera_video_finale(audio_url: str, immagini: list[str], testo_script:
         print(f"⏱️ Durata audio: {durata} secondi. Genero SRT...")
         
         # 4. Generazione Sottotitoli
-        genera_file_srt(testo_script, duration_totale=durata, srt_path=local_srt)
+        genera_file_srt(testo_script, durata_totale=durata, srt_path=local_srt)
         
         # 5. Rendering Video con FFmpeg - VERSIONE SALVA-RAM
         print("🎥 Rendering FFmpeg (Modalità Low-RAM attive)...")
