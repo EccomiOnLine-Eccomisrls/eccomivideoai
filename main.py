@@ -4,6 +4,10 @@ from supabase import create_client, Client
 from groq import AsyncGroq
 import httpx
 import os
+import re
+import tempfile
+import subprocess
+import requests
 
 app = FastAPI(title="EccomiVideoAI - Motore")
 
@@ -16,7 +20,6 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
 RUNPOD_ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID")
 
-# Il timbro vocale ufficiale di Eccomi Man
 VOICE_SAMPLE_URL = "https://jyksiqbmckdwtnmzgfhc.supabase.co/storage/v1/object/public/inputs/bf7edd64-9129-47bb-9f4f-92464b08d94a/dubbed_audio.wav"
 
 if SUPABASE_URL and SUPABASE_KEY:
@@ -27,15 +30,54 @@ else:
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 # ==========================================
-# MODELLO DATI (AGGIORNATO CON OPZIONI SFONDO)
+# MODELLO DATI
 # ==========================================
 class VideoRequest(BaseModel):
     user_id: str
     titolo_prodotto: str
     testo_script: str
     immagini_urls: list[str]
-    opzione_sfondo: str = "mantenere"  # Scelte possibili: mantenere, cambiare, inventa
-    url_sfondo_personalizzato: str = "" # URL se l'utente carica uno sfondo specifico
+    opzione_sfondo: str = "mantenere"
+    url_sfondo_personalizzato: str = ""
+
+# ==========================================
+# AUX: UTILITY PER TEMPI E SOTTOTITOLI
+# ==========================================
+def format_srt_time(seconds: float) -> str:
+    hrs = int(seconds // 3600)
+    mins = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{hrs:02d}:{mins:02d}:{secs:02d},{ms:03d}"
+
+def genera_file_srt(testo: str, durata_totale: float, srt_path: str):
+    parole = testo.split()
+    if not parole:
+        return
+    
+    # Raggruppiamo le parole (circa 3-4 parole per blocco di sottotitoli)
+    parole_per_blocco = 4
+    blocchi = [parole[i:i + parole_per_blocco] for i in range(0, len(parole), parole_per_blocco)]
+    
+    durata_blocco = durata_totale / len(blocchi)
+    
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for idx, blocco in enumerate(blocchi):
+            start_time = idx * durata_blocco
+            end_time = (idx + 1) * durata_blocco
+            testo_blocco = " ".join(blocco)
+            
+            f.write(f"{idx + 1}\n")
+            f.write(f"{format_srt_time(start_time)} --> {format_srt_time(end_time)}\n")
+            f.write(f"{testo_blocco}\n\n")
+
+def get_audio_duration(audio_path: str) -> float:
+    cmd = [
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nocrekey=1", audio_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return float(result.stdout.strip())
 
 # ==========================================
 # FASE 1: IL CERVELLO (Groq)
@@ -50,9 +92,8 @@ async def ottimizza_testo(testo_originale: str) -> str:
     
     Testo originale dell'utente: "{testo_originale}"
     
-    Regola fondamentale: Restituisci SOLO il testo finale che la mascotte dovrà leggere ad alta voce. Niente introduzioni ("Ecco il testo:"), niente commenti, niente virgolette."""
+    Regola fondamentale: Restituisci SOLO il testo finale che la mascotte dovrà leggere ad alta voce. Niente introduzioni, niente commenti, niente virgolette."""
 
-    print("🧠 Sto chiedendo a Groq (Llama 3.1) di ottimizzare il testo...")
     response = await groq_client.chat.completions.create(
         messages=[{"role": "user", "content": prompt}],
         model="llama-3.1-8b-instant",
@@ -61,20 +102,86 @@ async def ottimizza_testo(testo_originale: str) -> str:
     return response.choices[0].message.content
 
 # ==========================================
-# FASE 3: MONTAGGIO VIDEO (FFMPEG) - BOZZA LOGICA
+# FASE 3: MONTAGGIO VIDEO REALE CON FFMPEG
 # ==========================================
-async def genera_video_finale(audio_url: str, immagini: list[str], opzione_sfondo: str, sfondi_url: str, job_id: str):
-    """
-    Questa funzione prenderà l'audio generato da Runpod e le immagini del prodotto
-    e userà FFmpeg per comporre il video finale con i sottotitoli.
-    """
-    print(f"🎬 [3/5] Avvio montaggio video per Sfondo: {opzione_sfondo}...")
+async def genera_video_finale(audio_url: str, immagini: list[str], testo_script: str, job_id: str) -> str:
+    print(f"🎬 [3/5] Avvio montaggio video FFmpeg reale per il Job {job_id}...")
     
-    # TODO: Logica di download dei file locali, creazione file .srt per i sottotitoli
-    # ed esecuzione del comando FFmpeg.
-    
-    # Per ora simuliamo la chiusura rimandando l'audio nel DB per i test
-    return audio_url
+    # Creiamo una cartella temporanea di lavoro su Render
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_audio = os.path.join(tmpdir, "audio.wav")
+        local_image = os.path.join(tmpdir, "input_image.jpg")
+        local_srt = os.path.join(tmpdir, "subtitles.srt")
+        local_output = os.path.join(tmpdir, "output_video.mp4")
+        
+        # 1. Download dell'Audio generato da Runpod
+        print("⬇️ Scarico l'audio da Runpod...")
+        r_audio = requests.get(audio_url)
+        with open(local_audio, "wb") as f:
+            f.write(r_audio.content)
+            
+        # 2. Download dell'immagine (se l'URL non è valido usiamo un placeholder o la prima immagine fornita)
+        url_immagine = immagini[0] if immagini else "https://picsum.photos/1080/1920"
+        if "tuo-supabase.co" in url_immagine: # Se l'URL di test è finto, usiamo un placeholder verticale valido
+            url_immagine = "https://images.unsplash.com/photo-1542496658-e33a6d0d50f6?q=80&w=1080&auto=format&fit=crop"
+            
+        print(f"⬇️ Scarico l'immagine di background: {url_immagine}")
+        r_img = requests.get(url_immagine)
+        with open(local_image, "wb") as f:
+            f.write(r_img.content)
+            
+        # 3. Calcolo della durata esatta dell'audio
+        durata = get_audio_duration(local_audio)
+        print(f"⏱️ Durata audio calcolata: {durata} secondi")
+        
+        # 4. Generazione del file dei Sottotitoli .srt
+        genera_file_srt(testo_script, durata, local_srt)
+        print("📝 File SRT dei sottotitoli creato.")
+        
+        # 5. Esecuzione del comando FFmpeg
+        # Genera un video verticale (1080x1920), sincronizza l'audio e stampa i sottotitoli in basso stile Reel
+        print("🎥 Eseguo FFmpeg per il rendering video...")
+        
+        # Pulizia path per evitare problemi con i filtri ffmpeg su linux
+        safe_srt_path = local_srt.replace("\\", "/").replace(":", "\\:")
+        
+        cmd_ffmpeg = [
+            "ffmpeg", "-y",
+            "-loop", "1", "-i", local_image,
+            "-i", local_audio,
+            "-vf", f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,subtitles={safe_srt_path}:force_style='Alignment=2,FontSize=16,PrimaryColour=&H00FFFF&,OutlineColour=&H000000&,BorderStyle=3,Outline=1'",
+            "-c:v", "libx264", "-t", str(durata),
+            "-c:a", "aac", "-b:a", "192k",
+            "-pix_fmt", "yuv420p",
+            local_output
+        ]
+        
+        result = subprocess.run(cmd_ffmpeg, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise Exception(f"FFmpeg è fallito! Errore:\n{result.stderr}")
+            
+        print("✅ Rendering FFmpeg completato con successo!")
+        
+        # 6. Upload del video finale su Supabase Storage nel bucket inputs
+        print("☁️ Carico il video finale su Supabase...")
+        object_path = f"{job_id}/video_finale.mp4"
+        upload_url = f"{SUPABASE_URL}/storage/v1/object/inputs/{object_path}?upsert=true"
+        
+        with open(local_output, "rb") as f:
+            video_data = f.read()
+            
+        headers = {
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "apikey": SUPABASE_KEY,
+            "Content-Type": "video/mp4",
+        }
+        
+        r_upload = requests.put(upload_url, headers=headers, data=video_data)
+        if r_upload.status_code not in (200, 201):
+            raise Exception(f"Upload video fallito: {r_upload.text}")
+            
+        public_video_url = f"{SUPABASE_URL}/storage/v1/object/public/inputs/{object_path}"
+        return public_video_url
 
 # ==========================================
 # L'AGENTE IN BACKGROUND
@@ -87,7 +194,6 @@ async def esegui_agente_video(dati: VideoRequest, job_id: str):
         # --- FASE 1: TESTO ---
         print("[1/5] Elaborazione testo con Groq...")
         testo_definitivo = await ottimizza_testo(dati.testo_script)
-        print(f"✅ Testo finale generato: {testo_definitivo}")
         supabase.table("richieste_video").update({"testo_script": testo_definitivo}).eq("id", job_id).execute()
         
         # --- FASE 2: AUDIO (RUNPOD) ---
@@ -118,27 +224,24 @@ async def esegui_agente_video(dati: VideoRequest, job_id: str):
             raise Exception(f"Errore da Runpod: {dati_runpod}")
             
         audio_url_finale = dati_runpod["output"]["audio_url"]
-        print(f"✅ Audio generato con successo: {audio_url_finale}")
         
-        # --- FASE 3: VIDEO ---
+        # --- FASE 3: VIDEO CON SOTTOTITOLI ---
         supabase.table("richieste_video").update({"status": "generazione_video"}).eq("id", job_id).execute()
         
-        # Chiamata alla nostra nuova funzione di montaggio video
         video_url_render = await genera_video_finale(
             audio_url=audio_url_finale,
             immagini=dati.immagini_urls,
-            opzione_sfondo=dati.opzione_sfondo,
-            sfondi_url=dati.url_sfondo_personalizzato,
+            testo_script=testo_definitivo,
             job_id=job_id
         )
         
-        # Lavoro completato con successo
+        # Lavoro completato con successo! Salviamo il vero link del video MP4
         supabase.table("richieste_video").update({
             "status": "completato", 
             "video_url_finale": video_url_render
         }).eq("id", job_id).execute()
         
-        print("--- Lavoro completato! Video pronto. ---")
+        print(f"--- Lavoro completato! Video pronto: {video_url_render} ---")
         
     except Exception as e:
         print(f"ERRORE CRITICO: {e}")
@@ -164,4 +267,4 @@ async def ricevi_richiesta_video(richiesta: VideoRequest, background_tasks: Back
     job_id = risposta.data[0]['id']
 
     background_tasks.add_task(esegui_agente_video, richiesta, job_id)
-    return {"status": "success", "message": "L'Agente ha iniziato a elaborare il video!", "job_id": job_id}
+    return {"status": "success", "message": "L'Agente video è partito!", "job_id": job_id}
