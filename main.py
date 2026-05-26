@@ -27,13 +27,15 @@ else:
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 # ==========================================
-# MODELLO DATI
+# MODELLO DATI (AGGIORNATO CON OPZIONI SFONDO)
 # ==========================================
 class VideoRequest(BaseModel):
     user_id: str
     titolo_prodotto: str
     testo_script: str
     immagini_urls: list[str]
+    opzione_sfondo: str = "mantenere"  # Scelte possibili: mantenere, cambiare, inventa
+    url_sfondo_personalizzato: str = "" # URL se l'utente carica uno sfondo specifico
 
 # ==========================================
 # FASE 1: IL CERVELLO (Groq)
@@ -57,6 +59,22 @@ async def ottimizza_testo(testo_originale: str) -> str:
         temperature=0.7
     )
     return response.choices[0].message.content
+
+# ==========================================
+# FASE 3: MONTAGGIO VIDEO (FFMPEG) - BOZZA LOGICA
+# ==========================================
+async def genera_video_finale(audio_url: str, immagini: list[str], opzione_sfondo: str, sfondi_url: str, job_id: str):
+    """
+    Questa funzione prenderà l'audio generato da Runpod e le immagini del prodotto
+    e userà FFmpeg per comporre il video finale con i sottotitoli.
+    """
+    print(f"🎬 [3/5] Avvio montaggio video per Sfondo: {opzione_sfondo}...")
+    
+    # TODO: Logica di download dei file locali, creazione file .srt per i sottotitoli
+    # ed esecuzione del comando FFmpeg.
+    
+    # Per ora simuliamo la chiusura rimandando l'audio nel DB per i test
+    return audio_url
 
 # ==========================================
 # L'AGENTE IN BACKGROUND
@@ -92,25 +110,35 @@ async def esegui_agente_video(dati: VideoRequest, job_id: str):
             }
         }
         
-        # Chiamata asincrona a Runpod (timeout 5 minuti perché XTTS richiede tempo)
         async with httpx.AsyncClient(timeout=300.0) as client:
             risposta_runpod = await client.post(runpod_url, headers=headers, json=payload)
             dati_runpod = risposta_runpod.json()
         
-        # Controllo errori di Runpod
         if "error" in dati_runpod or ("output" in dati_runpod and dati_runpod["output"].get("ok") == False):
             raise Exception(f"Errore da Runpod: {dati_runpod}")
             
         audio_url_finale = dati_runpod["output"]["audio_url"]
         print(f"✅ Audio generato con successo: {audio_url_finale}")
         
-        # Per ora salviamo l'audio nel campo del video per poterlo ascoltare!
+        # --- FASE 3: VIDEO ---
+        supabase.table("richieste_video").update({"status": "generazione_video"}).eq("id", job_id).execute()
+        
+        # Chiamata alla nostra nuova funzione di montaggio video
+        video_url_render = await genera_video_finale(
+            audio_url=audio_url_finale,
+            immagini=dati.immagini_urls,
+            opzione_sfondo=dati.opzione_sfondo,
+            sfondi_url=dati.url_sfondo_personalizzato,
+            job_id=job_id
+        )
+        
+        # Lavoro completato con successo
         supabase.table("richieste_video").update({
             "status": "completato", 
-            "video_url_finale": audio_url_finale
+            "video_url_finale": video_url_render
         }).eq("id", job_id).execute()
         
-        print("--- Lavoro completato! Audio pronto. ---")
+        print("--- Lavoro completato! Video pronto. ---")
         
     except Exception as e:
         print(f"ERRORE CRITICO: {e}")
@@ -136,4 +164,4 @@ async def ricevi_richiesta_video(richiesta: VideoRequest, background_tasks: Back
     job_id = risposta.data[0]['id']
 
     background_tasks.add_task(esegui_agente_video, richiesta, job_id)
-    return {"status": "success", "message": "L'Agente ha iniziato a pensare e parlare!", "job_id": job_id}
+    return {"status": "success", "message": "L'Agente ha iniziato a elaborare il video!", "job_id": job_id}
