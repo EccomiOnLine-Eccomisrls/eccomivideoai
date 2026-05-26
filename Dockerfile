@@ -1,8 +1,8 @@
 # Usa un'immagine ufficiale di Python leggera
 FROM python:3.10-slim
 
-# Installa FFmpeg nel sistema operativo
-RUN apt-get update && apt-get install -y ffmpeg
+# Installa FFmpeg e ffprobe nel sistema operativo Linux di Docker
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
 # Imposta la cartella di lavoro
 WORKDIR /app
