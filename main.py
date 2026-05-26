@@ -70,19 +70,11 @@ def genera_file_srt(testo: str, durata_totale: float, srt_path: str):
             f.write(f"{testo_blocco}\n\n")
 
 def get_audio_duration(audio_path: str) -> float:
-    # Parametro "-of csv=p=0" modificato per massima compatibilità universale Linux
     cmd = [
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
         "-of", "csv=p=0", audio_path
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
-    
-    if result.returncode != 0 or not result.stdout.strip():
-        print(f"❌ FFPROBE FALLITO!")
-        print(f"❌ STDOUT di ffprobe: '{result.stdout}'")
-        print(f"❌ STDERR di ffprobe: '{result.stderr}'")
-        raise Exception(f"Ffprobe non è riuscito a leggere il file audio. Errore di sistema: {result.stderr}")
-        
     return float(result.stdout.strip())
 
 # ==========================================
@@ -108,10 +100,10 @@ async def ottimizza_testo(testo_originale: str) -> str:
     return response.choices[0].message.content
 
 # ==========================================
-# FASE 3: MONTAGGIO VIDEO REALE CON FFMPEG
+# FASE 3: MONTAGGIO VIDEO REALE (LIGHT VERSION)
 # ==========================================
 async def genera_video_finale(audio_url: str, immagini: list[str], testo_script: str, job_id: str) -> str:
-    print(f"🎬 [3/5] Avvio montaggio video FFmpeg reale per il Job {job_id}...")
+    print(f"🎬 [3/5] Avvio montaggio video FFmpeg ultra-leggero per il Job {job_id}...")
     
     with tempfile.TemporaryDirectory() as tmpdir:
         local_audio = os.path.join(tmpdir, "audio.wav")
@@ -120,44 +112,39 @@ async def genera_video_finale(audio_url: str, immagini: list[str], testo_script:
         local_output = os.path.join(tmpdir, "output_video.mp4")
         
         # 1. Download dell'Audio
-        print(f"⬇️ Scarico l'audio dall'URL: {audio_url}")
         r_audio = requests.get(audio_url)
-        
-        if r_audio.status_code != 200:
-            raise Exception(f"Impossibile scaricare l'audio generato. Status code: {r_audio.status_code}")
-            
         with open(local_audio, "wb") as f:
             f.write(r_audio.content)
-        print(f"✅ Audio scaricato con successo ({os.path.getsize(local_audio)} bytes)")
             
         # 2. Download dell'immagine di background
         url_immagine = immagini[0] if immagini else "https://picsum.photos/1080/1920"
         if "tuo-supabase.co" in url_immagine:
             url_immagine = "https://images.unsplash.com/photo-1542496658-e33a6d0d50f6?q=80&w=1080&auto=format&fit=crop"
             
-        print(f"⬇️ Scarico l'immagine di background: {url_immagine}")
         r_img = requests.get(url_immagine)
         with open(local_image, "wb") as f:
             f.write(r_img.content)
             
         # 3. Calcolo durata audio
         durata = get_audio_duration(local_audio)
-        print(f"⏱️ Durata audio calcolata: {durata} secondi")
+        print(f"⏱️ Durata audio: {durata} secondi. Genero SRT...")
         
         # 4. Generazione Sottotitoli
-        genera_file_srt(testo_script, durata, local_srt)
-        print("📝 File SRT dei sottotitoli creato.")
+        genera_file_srt(testo_script, duration_totale=durata, srt_path=local_srt)
         
-        # 5. Rendering Video con FFmpeg
-        print("🎥 Eseguo FFmpeg per il rendering video...")
+        # 5. Rendering Video con FFmpeg - VERSIONE SALVA-RAM
+        print("🎥 Rendering FFmpeg (Modalità Low-RAM attive)...")
         safe_srt_path = local_srt.replace("\\", "/").replace(":", "\\:")
         
         cmd_ffmpeg = [
             "ffmpeg", "-y",
-            "-loop", "1", "-i", local_image,
+            "-loop", "1", "-r", "10", "-i", local_image,   # -r 10 riduce il framerate all'origine risparmiando RAM
             "-i", local_audio,
             "-vf", f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,subtitles={safe_srt_path}:force_style='Alignment=2,FontSize=16,PrimaryColour=&H00FFFF&,OutlineColour=&H000000&,BorderStyle=3,Outline=1'",
-            "-c:v", "libx264", "-t", str(durata),
+            "-c:v", "libx264", 
+            "-preset", "ultrafast",                        # Velocizza l'editing abbattendo l'uso di memoria
+            "-crf", "28",                                  # Compressione ottimale per ambienti cloud leggeri
+            "-t", str(durata),
             "-c:a", "aac", "-b:a", "192k",
             "-pix_fmt", "yuv420p",
             local_output
@@ -188,8 +175,7 @@ async def genera_video_finale(audio_url: str, immagini: list[str], testo_script:
         if r_upload.status_code not in (200, 201):
             raise Exception(f"Upload video fallito: {r_upload.text}")
             
-        public_video_url = f"{SUPABASE_URL}/storage/v1/object/public/inputs/{object_path}"
-        return public_video_url
+        return f"{SUPABASE_URL}/storage/v1/object/public/inputs/{object_path}"
 
 # ==========================================
 # L'AGENTE IN BACKGROUND
@@ -203,24 +189,12 @@ async def esegui_agente_video(dati: VideoRequest, job_id: str):
         testo_definitivo = await ottimizza_testo(dati.testo_script)
         supabase.table("richieste_video").update({"testo_script": testo_definitivo}).eq("id", job_id).execute()
         
-        print("[2/5] Invio testo a Runpod per la clonazione vocale...")
+        print("[2/5] Invio testo a Runpod...")
         supabase.table("richieste_video").update({"status": "generazione_audio"}).eq("id", job_id).execute()
 
-        if not RUNPOD_API_KEY or not RUNPOD_ENDPOINT_ID:
-            raise Exception("Chiavi Runpod mancanti nelle variabili d'ambiente!")
-
         runpod_url = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/runsync"
-        headers = {
-            "Authorization": f"Bearer {RUNPOD_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "input": {
-                "text": testo_definitivo,
-                "voice_sample_url": VOICE_SAMPLE_URL,
-                "language": "it"
-            }
-        }
+        headers = {"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type": "application/json"}
+        payload = {"input": {"text": testo_definitivo, "voice_sample_url": VOICE_SAMPLE_URL, "language": "it"}}
         
         async with httpx.AsyncClient(timeout=300.0) as client:
             risposta_runpod = await client.post(runpod_url, headers=headers, json=payload)
@@ -234,7 +208,7 @@ async def esegui_agente_video(dati: VideoRequest, job_id: str):
         # --- FASE 3: VIDEO ---
         supabase.table("richieste_video").update({"status": "generazione_video"}).eq("id", job_id).execute()
         
-        video_url_render = await genera_video_finale(
+        video_url_finale = await genera_video_finale(
             audio_url=audio_url_finale,
             immagini=dati.immagini_urls,
             testo_script=testo_definitivo,
@@ -243,10 +217,10 @@ async def esegui_agente_video(dati: VideoRequest, job_id: str):
         
         supabase.table("richieste_video").update({
             "status": "completato", 
-            "video_url_finale": video_url_render
+            "video_url_finale": video_url_finale
         }).eq("id", job_id).execute()
         
-        print(f"--- Lavoro completato! Video pronto: {video_url_render} ---")
+        print(f"--- Lavoro completato! Video pronto: {video_url_finale} ---")
         
     except Exception as e:
         print(f"ERRORE CRITICO: {e}")
