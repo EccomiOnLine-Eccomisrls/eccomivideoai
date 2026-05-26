@@ -55,10 +55,8 @@ def genera_file_srt(testo: str, durata_totale: float, srt_path: str):
     if not parole:
         return
     
-    # Raggruppiamo le parole (circa 3-4 parole per blocco di sottotitoli)
     parole_per_blocco = 4
     blocchi = [parole[i:i + parole_per_blocco] for i in range(0, len(parole), parole_per_blocco)]
-    
     durata_blocco = durata_totale / len(blocchi)
     
     with open(srt_path, "w", encoding="utf-8") as f:
@@ -77,6 +75,13 @@ def get_audio_duration(audio_path: str) -> float:
         "-of", "default=noprint_wrappers=1:nocrekey=1", audio_path
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if result.returncode != 0 or not result.stdout.strip():
+        print(f"❌ FFPROBE FALLITO!")
+        print(f"❌ STDOUT di ffprobe: '{result.stdout}'")
+        print(f"❌ STDERR di ffprobe: '{result.stderr}'")
+        raise Exception(f"Ffprobe non è riuscito a leggere il file audio. Errore di sistema: {result.stderr}")
+        
     return float(result.stdout.strip())
 
 # ==========================================
@@ -107,22 +112,28 @@ async def ottimizza_testo(testo_originale: str) -> str:
 async def genera_video_finale(audio_url: str, immagini: list[str], testo_script: str, job_id: str) -> str:
     print(f"🎬 [3/5] Avvio montaggio video FFmpeg reale per il Job {job_id}...")
     
-    # Creiamo una cartella temporanea di lavoro su Render
     with tempfile.TemporaryDirectory() as tmpdir:
         local_audio = os.path.join(tmpdir, "audio.wav")
         local_image = os.path.join(tmpdir, "input_image.jpg")
         local_srt = os.path.join(tmpdir, "subtitles.srt")
         local_output = os.path.join(tmpdir, "output_video.mp4")
         
-        # 1. Download dell'Audio generato da Runpod
-        print("⬇️ Scarico l'audio da Runpod...")
+        # 1. Download sicuro dell'Audio da Runpod/Supabase
+        print(f"⬇️ Scarico l'audio dall'URL: {audio_url}")
         r_audio = requests.get(audio_url)
+        
+        if r_audio.status_code != 200:
+            print(f"❌ Errore download audio. Status: {r_audio.status_code}")
+            print(f"❌ Contenuto risposta errore: {r_audio.text[:500]}")
+            raise Exception(f"Impossibile scaricare l'audio generato. Status code: {r_audio.status_code}")
+            
         with open(local_audio, "wb") as f:
             f.write(r_audio.content)
+        print(f"✅ Audio scaricato con successo ({os.path.getsize(local_audio)} bytes)")
             
-        # 2. Download dell'immagine (se l'URL non è valido usiamo un placeholder o la prima immagine fornita)
+        # 2. Download dell'immagine di background
         url_immagine = immagini[0] if immagini else "https://picsum.photos/1080/1920"
-        if "tuo-supabase.co" in url_immagine: # Se l'URL di test è finto, usiamo un placeholder verticale valido
+        if "tuo-supabase.co" in url_immagine:
             url_immagine = "https://images.unsplash.com/photo-1542496658-e33a6d0d50f6?q=80&w=1080&auto=format&fit=crop"
             
         print(f"⬇️ Scarico l'immagine di background: {url_immagine}")
@@ -130,19 +141,16 @@ async def genera_video_finale(audio_url: str, immagini: list[str], testo_script:
         with open(local_image, "wb") as f:
             f.write(r_img.content)
             
-        # 3. Calcolo della durata esatta dell'audio
+        # 3. Calcolo durata audio (ora protetto da log estesi)
         durata = get_audio_duration(local_audio)
         print(f"⏱️ Durata audio calcolata: {durata} secondi")
         
-        # 4. Generazione del file dei Sottotitoli .srt
+        # 4. Generazione Sottotitoli
         genera_file_srt(testo_script, durata, local_srt)
         print("📝 File SRT dei sottotitoli creato.")
         
-        # 5. Esecuzione del comando FFmpeg
-        # Genera un video verticale (1080x1920), sincronizza l'audio e stampa i sottotitoli in basso stile Reel
+        # 5. Rendering Video con FFmpeg
         print("🎥 Eseguo FFmpeg per il rendering video...")
-        
-        # Pulizia path per evitare problemi con i filtri ffmpeg su linux
         safe_srt_path = local_srt.replace("\\", "/").replace(":", "\\:")
         
         cmd_ffmpeg = [
@@ -158,11 +166,12 @@ async def genera_video_finale(audio_url: str, immagini: list[str], testo_script:
         
         result = subprocess.run(cmd_ffmpeg, capture_output=True, text=True)
         if result.returncode != 0:
+            print(f"❌ FFmpeg fallito. STDERR: {result.stderr}")
             raise Exception(f"FFmpeg è fallito! Errore:\n{result.stderr}")
             
         print("✅ Rendering FFmpeg completato con successo!")
         
-        # 6. Upload del video finale su Supabase Storage nel bucket inputs
+        # 6. Upload del video su Supabase Storage
         print("☁️ Carico il video finale su Supabase...")
         object_path = f"{job_id}/video_finale.mp4"
         upload_url = f"{SUPABASE_URL}/storage/v1/object/inputs/{object_path}?upsert=true"
@@ -191,12 +200,10 @@ async def esegui_agente_video(dati: VideoRequest, job_id: str):
     try:
         supabase.table("richieste_video").update({"status": "elaborazione_testo"}).eq("id", job_id).execute()
         
-        # --- FASE 1: TESTO ---
         print("[1/5] Elaborazione testo con Groq...")
         testo_definitivo = await ottimizza_testo(dati.testo_script)
         supabase.table("richieste_video").update({"testo_script": testo_definitivo}).eq("id", job_id).execute()
         
-        # --- FASE 2: AUDIO (RUNPOD) ---
         print("[2/5] Invio testo a Runpod per la clonazione vocale...")
         supabase.table("richieste_video").update({"status": "generazione_audio"}).eq("id", job_id).execute()
 
@@ -225,7 +232,7 @@ async def esegui_agente_video(dati: VideoRequest, job_id: str):
             
         audio_url_finale = dati_runpod["output"]["audio_url"]
         
-        # --- FASE 3: VIDEO CON SOTTOTITOLI ---
+        # --- FASE 3: VIDEO ---
         supabase.table("richieste_video").update({"status": "generazione_video"}).eq("id", job_id).execute()
         
         video_url_render = await genera_video_finale(
@@ -235,7 +242,6 @@ async def esegui_agente_video(dati: VideoRequest, job_id: str):
             job_id=job_id
         )
         
-        # Lavoro completato con successo! Salviamo il vero link del video MP4
         supabase.table("richieste_video").update({
             "status": "completato", 
             "video_url_finale": video_url_render
