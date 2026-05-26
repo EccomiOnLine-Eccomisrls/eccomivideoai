@@ -48,7 +48,7 @@ async def ottimizza_testo(testo_originale: str) -> str:
     print("🧠 Sto chiedendo a Groq (Llama 3) di ottimizzare il testo...")
     response = await groq_client.chat.completions.create(
         messages=[{"role": "user", "content": prompt}],
-        model="llama3-8b-8192", # Modello velocissimo e potente
+        model="llama-3.1-8b-instant", # Modello velocissimo e potente
         temperature=0.7
     )
     return response.choices[0].message.content
