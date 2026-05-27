@@ -7,6 +7,7 @@ import os
 import tempfile
 import subprocess
 import requests
+import asyncio # <--- NUOVO IMPORT FONDAMENTALE PER IL POLLING
 
 app = FastAPI(title="EccomiVideoAI - Motore SaaS")
 
@@ -139,11 +140,35 @@ async def esegui_agente_video(dati: VideoRequest, job_id: str):
         payload_video = {"input": {"image_url": immagine_base, "prompt": "A dynamic, cinematic advertisement animation of the subject, high quality, moving"}}
         
         async with httpx.AsyncClient(timeout=600.0) as client:
-            r_video = await client.post(f"https://api.runpod.ai/v2/{RUNPOD_VIDEO_ENDPOINT_ID}/runsync", headers=headers, json=payload_video)
-            dati_video = r_video.json()
-            if "error" in dati_video or ("output" in dati_video and "error" in dati_video.get("output", {})):
-                raise Exception(f"Errore Motore Video AI: {dati_video}")
-            video_animato_url = dati_video["output"]["video_url"]
+            # NOVITÀ: Usiamo /run invece di /runsync e facciamo il polling
+            r_video = await client.post(f"https://api.runpod.ai/v2/{RUNPOD_VIDEO_ENDPOINT_ID}/run", headers=headers, json=payload_video)
+            runpod_job = r_video.json()
+            
+            if "id" not in runpod_job:
+                raise Exception(f"Errore avvio Runpod: {runpod_job}")
+            
+            runpod_job_id = runpod_job["id"]
+            print(f"Job Video su Runpod avviato (ID: {runpod_job_id}). Attendo che finisca...")
+            
+            # Polling: Chiediamo a Runpod ogni 10 secondi se ha finito
+            video_animato_url = None
+            for _ in range(60): # Attesa massima 10 minuti (60 * 10 sec)
+                await asyncio.sleep(10)
+                r_status = await client.get(f"https://api.runpod.ai/v2/{RUNPOD_VIDEO_ENDPOINT_ID}/status/{runpod_job_id}", headers=headers)
+                status_data = r_status.json()
+                stato_runpod = status_data.get("status")
+                
+                if stato_runpod == "COMPLETED":
+                    video_animato_url = status_data["output"]["video_url"]
+                    print("Generazione video Runpod completata!")
+                    break
+                elif stato_runpod in ["FAILED", "CANCELLED", "TIMEOUT"]:
+                    raise Exception(f"Errore Motore Video AI: {status_data}")
+                else:
+                    print(f"Runpod sta elaborando... stato attuale: {stato_runpod}")
+            
+            if not video_animato_url:
+                raise Exception("Timeout: La generazione del video ha superato i 10 minuti.")
         
         # [4/5] Montaggio
         supabase.table("richieste_video").update({"status": "montaggio_finale"}).eq("id", job_id).execute()
